@@ -20,7 +20,7 @@ from aiogram.filters import Command
 from aiogram.types import (Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
     ReplyKeyboardMarkup, KeyboardButton, BufferedInputFile, BotCommand)
 from dotenv import load_dotenv
-from core import Store, parse_task, parse_due, LISTS, REPEATS
+from core import Store, parse_task, parse_due, LISTS, REPEATS, parse_checklist, validate_checklist
 
 load_dotenv()
 log = logging.getLogger('dragon')
@@ -34,6 +34,7 @@ HELP = '''🐉 <b>Dragon Tasks</b>
 Можно написать: «Завтра в 18:00 купить аккумулятор».
 Точный формат: «Проверить NAS #работа / завтра 10:00».
 
+Можно прислать встроенный список Telegram или текст: заголовок и пункты с новой строки. «☑️ Пункты списка» — отметки сохраняются, в напоминании виден прогресс.
 После сохранения назначь время и раздел кнопками. «🔁 Повторение»: раз в день, неделю, месяц или год. Без срока задача остаётся в списке, уведомления не будет.
 
 В напоминании только <b>✅ Выполнено</b> и <b>📅 Перенести</b>.
@@ -58,7 +59,7 @@ def reminder_keyboard(tid, occurrence=None):
     return markup([[('✅ Выполнено',f'done:{tid}' + (f':{occurrence}' if occurrence is not None else '')),('📅 Перенести',f'move:{tid}')]])
 
 
-def task_keyboard(task):
+def task_keyboard(task, has_checklist=False):
     tid = task['id']
     rows = []
     if task['draft']:
@@ -68,6 +69,8 @@ def task_keyboard(task):
     rows += [[('⏰ Назначить время',f'move:{tid}'),('📂 Раздел',f'category:{tid}')],
              [('✏️ Изменить текст',f'edit:{tid}'),('📎 Вложения',f'files:{tid}')],
              [('📎 Добавить вложения',f'attach:{tid}'),('🗑 Удалить',f'askdel:{tid}')]]
+    if has_checklist:
+        rows.append([('☑️ Пункты списка',f'checks:{tid}:0')])
     if not task['done']:
         rows.append([('🔁 Повторение',f'repeat:{tid}')])
     return markup(rows)
@@ -78,6 +81,26 @@ def format_task(task,tz):
     status = '📝 Проверь задачу' if task['draft'] else '✅ Выполнено' if task['done'] else '🐉 Задача'
     repetition = '\n🔁 '+REPEATS[task['repeat']] if task['repeat'] else ''
     return f"<b>{status} #{task['id']}</b>\n{escape(task['title'])}\n\n📂 {escape(task['category'])}\n⏰ {due} · {tz.key}{repetition}"
+
+
+def checklist_text(items):
+    if not items:
+        return ''
+    done = sum(item['done'] for item in items)
+    return '\n\n☑️ <b>Список: '+str(done)+' из '+str(len(items))+' выполнено</b>\n'+'\n'.join(('✅ ' if item['done'] else '⬜ ')+escape(item['text']) for item in items)
+
+
+def checklist_keyboard(tid, items, offset=0):
+    rows = [[(('✅ ' if item['done'] else '⬜ ')+item['text'][:45],f'check:{tid}:{item["id"]}:{int(not item["done"])}:{offset}')] for item in items[offset:offset+10]]
+    navigation = []
+    if offset>0:
+        navigation.append(('←',f'checks:{tid}:{offset-10}'))
+    if offset+10<len(items):
+        navigation.append(('→',f'checks:{tid}:{offset+10}'))
+    if navigation:
+        rows.append(navigation)
+    rows.append([('Снять все отметки',f'clearchecks:{tid}:{offset}'),('Карточка задачи',f'back:{tid}')])
+    return markup(rows)
 
 
 def extract_attachment(message):
@@ -100,12 +123,16 @@ async def send_files(bot,uid,files):
 async def send_reminder(bot,task,store,tz):
     uid = task['user_id']
     files = store.attachments(task['id'])
-    text = '⏰ <b>Напоминание</b>\n'+format_task(task,tz)
+    items = store.checklist(uid,task['id'])
+    text = '⏰ <b>Напоминание</b>\n'+format_task(task,tz)+checklist_text(items)
     if len(files)==1 and files[0]['kind']=='photo' and len(text)<=1024:
         await bot.send_photo(uid,files[0]['file_id'],caption=text,reply_markup=reminder_keyboard(task['id'], task['due'] if task['repeat'] else None))
     else:
         await send_files(bot,uid,files)
         await bot.send_message(uid,text,reply_markup=reminder_keyboard(task['id'], task['due'] if task['repeat'] else None))
+
+    if items:
+        await bot.send_message(uid,'☑️ Отмечай пункты кнопками. Отметки сохраняются.',reply_markup=checklist_keyboard(task['id'],items))
 
 
 class Access(BaseMiddleware):
@@ -161,13 +188,15 @@ def build_dispatcher(store,tz,allowed):
     dp = Dispatcher(store=store,tz=tz)
     dp.message.outer_middleware(Access(allowed))
     dp.callback_query.outer_middleware(Access(allowed))
+    dp.edited_message.outer_middleware(Access(allowed))
 
     async def card(bot,uid,tid,prefix=''):
         task = store.get(uid,tid)
         if task:
             files = store.attachments(tid)
             suffix = f'\n📎 Вложений: {len(files)}' if files else ''
-            await bot.send_message(uid,prefix+format_task(task,tz)+suffix,reply_markup=task_keyboard(task))
+            items=store.checklist(uid,tid)
+            await bot.send_message(uid,prefix+format_task(task,tz)+checklist_text(items)+suffix,reply_markup=task_keyboard(task,bool(items)))
 
     async def show(bot,uid,mode='all',category=None,offset=0):
         tasks = store.list(uid,mode,category,datetime.now(tz),limit=9,offset=offset)
@@ -177,6 +206,41 @@ def build_dispatcher(store,tz,allowed):
             await card(bot,uid,task['id'])
         if len(tasks)>8:
             await bot.send_message(uid,'Следующая страница:',reply_markup=markup([[('Дальше →',f'page:{mode}:{category or "-"}:{offset+8}')]]))
+
+    @dp.edited_message(F.checklist)
+    async def edited_checklist(message:Message,bot:Bot):
+        try:
+            tid=store.sync_native_checklist(message.from_user.id,message.message_id,message.checklist)
+            if tid:
+                await card(bot,message.from_user.id,tid,'Список Telegram обновлён.\n')
+        except ValueError as exc:
+            await message.answer(escape(str(exc)))
+
+    @dp.message(F.checklist_tasks_done | F.checklist_tasks_added)
+    async def native_checklist_change(message:Message,bot:Bot):
+        uid=message.from_user.id
+        event=message.checklist_tasks_done or message.checklist_tasks_added
+        source=event.checklist_message
+        if not source:
+            return
+        tid=store.checklist_source(uid,source.message_id)
+        if not tid:
+            return
+        try:
+            if source.checklist:
+                store.sync_native_checklist(uid,source.message_id,source.checklist)
+            if message.checklist_tasks_done:
+                store.native_checks_done(uid,tid,event.marked_as_done_task_ids,event.marked_as_not_done_task_ids)
+            elif message.checklist_tasks_added:
+                existing={item['source_item'] for item in store.checklist(uid,tid)}
+                added=[item for item in event.tasks if item.id not in existing]
+                all_items=[(item['text'],bool(item['done'])) for item in store.checklist(uid,tid)]+[(item.text,False) for item in added]
+                validate_checklist(all_items)
+                if added:
+                    store.add_checklist(uid,tid,[(item.text,False) for item in added],[item.id for item in added])
+            await card(bot,uid,tid,'Отметки списка сохранены.\n')
+        except ValueError as exc:
+            await message.answer(escape(str(exc)))
 
     @dp.message(Command('start'))
     async def start(message:Message):
@@ -272,6 +336,7 @@ def build_dispatcher(store,tz,allowed):
                 await bot.send_message(uid,'Сначала подтверди задачу.')
                 return
             if task['repeat']:
+                store.check_all(uid,tid,True)
                 try:
                     occurrence = int(parts[2]) if len(parts)>2 else task['due']
                 except ValueError:
@@ -281,10 +346,32 @@ def build_dispatcher(store,tz,allowed):
                 await query.message.edit_reply_markup(reply_markup=None)
                 await card(bot,uid,tid,'✅ Выполнено. Повторение продолжается.\n')
                 return
+            store.check_all(uid,tid,True)
             store.finish(uid,tid)
             store.clear_input(uid)
             await query.message.edit_reply_markup(reply_markup=None)
             await bot.send_message(uid,f'✅ Задача #{tid} выполнена.')
+        elif command in ('checks','check','clearchecks'):
+            try:
+                offset=int(parts[-1])
+                items=store.checklist(uid,tid)
+                if not items or offset<0 or offset%10 or offset>=len(items):
+                    return
+                if command=='check':
+                    item_id,done=int(parts[2]),int(parts[3])
+                    if done not in (0,1) or not store.check_item(uid,tid,item_id,done):
+                        return
+                elif command=='clearchecks':
+                    store.check_all(uid,tid,False)
+                items=store.checklist(uid,tid)
+                body='☑️ <b>'+escape(task['title'])+'</b>'+checklist_text(items)+'\n\nНажми пункт, чтобы отметить или снять отметку.'
+                keyboard=checklist_keyboard(tid,items,offset)
+                if command=='checks':
+                    await bot.send_message(uid,body,reply_markup=keyboard)
+                else:
+                    await query.message.edit_text(body,reply_markup=keyboard)
+            except (ValueError,IndexError):
+                return
         elif command=='repeat':
             await bot.send_message(uid,'Как часто напоминать? Повторение идёт автоматически, даже если не нажимать «Выполнено».',reply_markup=markup(
                 [[(label,f'setrepeat:{tid}:{kind}')] for kind,label in REPEATS.items()] +
@@ -417,6 +504,9 @@ def build_dispatcher(store,tz,allowed):
             return
         attachment=extract_attachment(message)
         pending=store.input(uid)
+        if message.checklist:
+            store.clear_input(uid)
+            pending=None
         if pending:
             tid=pending['task_id']
             task=store.get(uid,tid)
@@ -451,6 +541,23 @@ def build_dispatcher(store,tz,allowed):
                 except ValueError as exc:
                     await message.answer(escape(str(exc)))
                 return
+        items=[]
+        try:
+            if message.checklist:
+                existing=store.checklist_source(uid,message.message_id)
+                if existing:
+                    await card(bot,uid,existing)
+                    return
+                text=message.checklist.title
+                items=[(item.text,bool(item.completion_date or item.completed_by_user or item.completed_by_chat)) for item in message.checklist.tasks]
+                validate_checklist(items)
+            elif text:
+                parsed=parse_checklist(text)
+                if parsed:
+                    text,items=parsed
+        except ValueError as exc:
+            await message.answer(escape(str(exc)))
+            return
         if not text and not attachment:
             await message.answer('Пришли текст, фото, голосовое, видео или документ.')
             return
@@ -482,6 +589,10 @@ def build_dispatcher(store,tz,allowed):
         tid=store.add(uid,title,category,due,int(datetime.now(tz).timestamp()))
         if due:
             store.edit(uid,tid,draft=1)
+        if items:
+            store.add_checklist(uid,tid,items,[item.id for item in message.checklist.tasks] if message.checklist else None)
+            if message.checklist:
+                store.checklist_source(uid,message.message_id,tid)
         if attachment:
             store.attach(uid,tid,*attachment,message.message_id)
         if message.media_group_id:
