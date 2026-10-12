@@ -25,6 +25,10 @@ from core import Store, parse_task, parse_due, LISTS, REPEATS
 load_dotenv()
 log = logging.getLogger('dragon')
 CATEGORIES = ['Учёба', 'Личное', 'Работа', 'VPN']
+START = '''🐉 <b>Dragon Tasks | Задачи</b>
+Пришли текст, фото, документ, голосовое или перешли сообщение.
+Можно написать: «Завтра в 18:00 зайди на ВБ».
+Точный формат: «Начало работы на Денди #VPN/ завтра 10:00».'''
 HELP = '''🐉 <b>Dragon Tasks</b>
 Пришли текст, фото, документ, голосовое или перешли сообщение.
 Можно написать: «Завтра в 18:00 купить аккумулятор».
@@ -173,11 +177,15 @@ def build_dispatcher(store,tz,allowed):
         if len(tasks)>8:
             await bot.send_message(uid,'Следующая страница:',reply_markup=markup([[('Дальше →',f'page:{mode}:{category or "-"}:{offset+8}')]]))
 
-    @dp.message(Command('start','help'))
+    @dp.message(Command('start'))
     async def start(message:Message):
-        await message.answer(HELP,reply_markup=ReplyKeyboardMarkup(keyboard=[
+        await message.answer(START,reply_markup=ReplyKeyboardMarkup(keyboard=[
             [KeyboardButton(text='📅 Сегодня'),KeyboardButton(text='📋 Все задачи')],
             [KeyboardButton(text='📂 Разделы'),KeyboardButton(text='⚠️ Просроченные')]],resize_keyboard=True))
+
+    @dp.message(Command('help'))
+    async def help_command(message:Message):
+        await message.answer(HELP)
 
     @dp.message(Command('cancel'))
     async def cancel(message:Message):
