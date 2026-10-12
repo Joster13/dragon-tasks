@@ -1,6 +1,6 @@
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from unittest.mock import patch
@@ -8,7 +8,7 @@ from aiogram import Bot
 from aiogram.client.session.base import BaseSession
 from aiogram.methods import SendMessage,SendPhoto,SendVoice,EditMessageReplyMarkup
 from aiogram.types import Message
-from core import Store,parse_task,parse_due
+from core import Store,parse_task,parse_due,next_repeat
 from main import build_dispatcher,scheduler_tick,send_reminder
 TZ=ZoneInfo('Europe/Moscow')
 NOW=datetime(2026,10,12,10,0,tzinfo=TZ)
@@ -45,6 +45,30 @@ class CoreTests(unittest.TestCase):
         self.assertIsNotNone(due)
         self.assertEqual(parse_task('Проверить https://example.com/path',NOW)[0],'Проверить https://example.com/path')
         with self.assertRaises(ValueError): parse_task('Задача / завтра 25:00',NOW)
+    def test_repeat_calendar(self):
+        def stamp(y,m,d): return int(datetime(y,m,d,10,tzinfo=TZ).timestamp())
+        jan=stamp(2027,1,31)
+        feb=next_repeat(jan,'monthly',jan,jan,TZ)
+        self.assertEqual(feb,stamp(2027,2,28))
+        self.assertEqual(next_repeat(feb,'monthly',jan,feb,TZ),stamp(2027,3,31))
+        leap=stamp(2028,2,29)
+        self.assertEqual(next_repeat(leap,'yearly',leap,leap,TZ),stamp(2029,2,28))
+        self.assertEqual(next_repeat(stamp(2031,2,28),'yearly',leap,stamp(2031,2,28),TZ),stamp(2032,2,29))
+        self.assertEqual(next_repeat(jan,'weekly',jan,stamp(2027,2,20),TZ),stamp(2027,2,21))
+    def test_repeat_storage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path=str(Path(tmp)/'tasks.db'); store=Store(path)
+            tid=store.add(1,'Задача','Личное',None,0)
+            with self.assertRaises(ValueError): store.set_repeat(1,tid,'daily')
+            due=int(NOW.timestamp()); store.snooze(1,tid,due); store.set_repeat(1,tid,'monthly')
+            with self.assertRaises(ValueError): store.set_repeat(2,tid,'daily')
+            store.attach(1,tid,'photo','photo1',1); store.close(); store=Store(path)
+            self.assertEqual(store.get(1,tid)['repeat'],'monthly')
+            self.assertTrue(store.advance_repeat(1,tid,due,due,TZ))
+            self.assertFalse(store.advance_repeat(1,tid,due,due,TZ))
+            self.assertEqual(len(store.attachments(tid)),1)
+            store.snooze(1,tid,due+900); self.assertEqual(store.get(1,tid)['repeat_anchor'],due+900)
+            store.set_repeat(1,tid,''); self.assertEqual(store.get(1,tid)['repeat'],''); store.close()
     def test_persistence_and_drafts(self):
         with tempfile.TemporaryDirectory() as tmp:
             path=str(Path(tmp)/'tasks.db'); store=Store(path)
@@ -99,6 +123,32 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await scheduler_tick(self.bot,self.store,TZ,{1}); count=len(self.session.calls)
         await scheduler_tick(self.bot,self.store,TZ,{1}); self.assertEqual(len(self.session.calls),count)
         self.assertEqual(self.store.get(1,tid)['notified'],1)
+    async def test_recurring_reminder_and_completion(self):
+        due=int(NOW.timestamp())-30
+        tid=self.store.add(1,'Ежедневная','Личное',due,0)
+        self.store.attach(1,tid,'photo','photo1',1)
+        await self.callback(f'setrepeat:{tid}:daily')
+        self.store.set_digest(1,'off')
+        with patch('main.datetime', wraps=datetime) as clock:
+            clock.now.return_value=NOW
+            await scheduler_tick(self.bot,self.store,TZ,{1})
+            next_due=self.store.get(1,tid)['due']
+            self.assertEqual(next_due,due+86400)
+            reminder=self.session.calls[-1]
+            self.assertIsInstance(reminder,SendPhoto)
+            self.assertEqual(len(reminder.reply_markup.inline_keyboard[0]),2)
+            self.assertEqual(reminder.reply_markup.inline_keyboard[0][0].callback_data,f'done:{tid}:{due}')
+            await self.callback(f'done:{tid}:{due}')
+            self.assertEqual(self.store.get(1,tid)['due'],next_due)
+            self.assertFalse(self.store.get(1,tid)['done'])
+            count=len(self.session.calls)
+            await scheduler_tick(self.bot,self.store,TZ,{1})
+            self.assertEqual(len(self.session.calls),count)
+            clock.now.return_value=NOW+timedelta(days=1)
+            await scheduler_tick(self.bot,self.store,TZ,{1})
+            self.assertEqual(self.store.get(1,tid)['due'],due+2*86400)
+        await self.callback(f'setrepeat:{tid}:off')
+        self.assertEqual(self.store.get(1,tid)['repeat'],'')
     async def test_voice_requires_confirmation(self):
         await self.message(voice={'file_id':'v1','file_unique_id':'v','duration':5}); tid=self.store.list(1)[0]['id']
         with patch.dict('os.environ',{'OPENAI_API_KEY':'test'}),patch('main.transcribe',return_value='Купить кабель #работа / завтра 18:00') as mocked:
