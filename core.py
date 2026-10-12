@@ -9,6 +9,13 @@ from zoneinfo import ZoneInfo
 LISTS = {"работа": "Работа", "личное": "Личное", "учёба": "Учёба", "учеба": "Учёба", "vpn": "VPN"}
 
 
+MONTHS = {name: number for number, names in enumerate([
+    ('января','январь'),('февраля','февраль'),('марта','март'),('апреля','апрель'),
+    ('мая','май'),('июня','июнь'),('июля','июль'),('августа','август'),
+    ('сентября','сентябрь'),('октября','октябрь'),('ноября','ноябрь'),('декабря','декабрь')],1) for name in names}
+WEEKDAYS = {'понедельник':0,'вторник':1,'среду':2,'среда':2,'четверг':3,'пятницу':4,'пятница':4,'субботу':5,'суббота':5,'воскресенье':6}
+
+
 def parse_task(text, now):
     """Accept title [#list] [/ deadline]. Never silently discard an invalid date."""
     parts = re.split(r"/\s+|\s*\|\s*", text.strip(), maxsplit=1)
@@ -26,10 +33,12 @@ def parse_task(text, now):
     else:
         # Extract only explicit date/time phrases, avoiding random numbers in titles.
         clock = r"(?:\d{1,2}:\d{2}|(?:\d{1,2}|одиннадцать|двенадцать|десять|девять|восемь|семь|шесть|пять|четыре|три|два|один)(?:\s+час(?:а|ов)?)?)"
-        patterns = [r"через\s+\d{1,4}\s*(?:минут[уы]?|мин|час(?:а|ов)?|день|дня|дней)",
-                    rf"(?:сегодня|завтра|послезавтра)\s+(?:в\s+)?{clock}",
-                    rf"(?:в\s+)?(?:понедельник|вторник|среду|четверг|пятницу|субботу|воскресенье)\s+(?:в\s+)?{clock}",
-                    r"\d{2}\.\d{2}(?:\.\d{4})?\s+(?:в\s+)?\d{1,2}:\d{2}"]
+        optional_time = rf"(?:\s+(?:в\s+)?{clock})?"
+        patterns = [r"\bчерез\s+\d{1,4}\s*(?:минут[уы]?|мин|час(?:а|ов)?|день|дня|дней)\b",
+                    rf"\b(?:сегодня|завтра|послезавтра)\b{optional_time}",
+                    rf"\b(?:в\s+)?(?:(?:этот|эту|это|следующий|следующую|следующее)\s+)?(?:{'|'.join(WEEKDAYS)})\b{optional_time}",
+                    rf"\b\d{{1,2}}\s+(?:{'|'.join(MONTHS)})\b(?:\s+\d{{4}}(?:\s*(?:года|г\.?))?)?{optional_time}",
+                    rf"(?<![\d.])\d{{1,2}}\.\d{{1,2}}(?:\.\d{{4}})?{optional_time}(?![\d.])"]
         matches = [m for p in patterns for m in re.finditer(p,title,re.I)]
         if len(matches)>1:
             raise ValueError("Нашёл несколько сроков. Укажи один срок после / или назначь его кнопкой.")
@@ -44,7 +53,7 @@ def parse_task(text, now):
 
 
 def parse_due(text, now):
-    s = text.lower().strip().replace("ё", "е")
+    s = re.sub(r"\s+", " ", text.lower().strip().replace("ё", "е")).strip(" ,!")
     relative = re.fullmatch(r"через\s+(\d{1,4})\s*(мин(?:ут[уы]?)?|м|час(?:а|ов)?|ч|д(?:ень|ня|ней)?|д)", s)
     if relative:
         n, unit = relative.groups()
@@ -53,43 +62,62 @@ def parse_due(text, now):
             raise ValueError("Интервал должен быть больше нуля.")
         delta = timedelta(minutes=n) if unit.startswith("м") else timedelta(hours=n) if unit.startswith("ч") else timedelta(days=n)
         return int((now + delta).timestamp())
-    # Spoken hours and weekdays are normalized before strict parsing.
     words = {"один":1,"два":2,"три":3,"четыре":4,"пять":5,"шесть":6,"семь":7,"восемь":8,"девять":9,"десять":10,"одиннадцать":11,"двенадцать":12}
     for word, number in words.items():
         s = re.sub(r"\b"+word+r"\b",str(number),s)
     s = re.sub(r"(?:\s+час(?:а|ов)?)$","",s)
-    s = re.sub(r"(?<![:\d])(\d{1,2})$",r"\1:00",s)
-    weekdays = {"понедельник":0,"вторник":1,"среду":2,"четверг":3,"пятницу":4,"субботу":5,"воскресенье":6}
-    week = re.fullmatch(r"(?:в\s+)?("+"|".join(weekdays)+r")\s+(?:в\s+)?(\d{1,2}):(\d{2})",s)
-    if week:
-        day,hour,minute = week.groups()
+    time_pattern = r"(?:\s+(?:в\s+)?(\d{1,2})(?::(\d{2}))?)?"
+    def clock(hour, minute):
         try:
-            target = now.replace(hour=int(hour),minute=int(minute),second=0,microsecond=0)+timedelta(days=(weekdays[day]-now.weekday())%7)
+            return now.replace(hour=int(hour) if hour is not None else 9, minute=int(minute or 0), second=0,microsecond=0)
         except ValueError as exc:
             raise ValueError("Такого времени нет.") from exc
-        if target<=now:
-            target += timedelta(days=7)
+    def future(target):
+        if target <= now:
+            raise ValueError("Срок уже прошёл. Укажи будущую дату и время.")
         return int(target.timestamp())
-    match = re.fullmatch(r"(?:(сегодня|завтра|послезавтра|\d{2}\.\d{2}(?:\.\d{4})?)\s+)?(?:в\s+)?(\d{1,2}):(\d{2})", s)
-    if not match:
-        raise ValueError("Не понял срок. Пример: завтра 18:00, 15.10.2026 09:30 или через 30 минут.")
-    day, hour, minute = match.groups()
-    try:
-        target = now.replace(hour=int(hour), minute=int(minute), second=0, microsecond=0)
-        if day in ("сегодня", "завтра", "послезавтра"):
-            target += timedelta(days={"сегодня": 0, "завтра": 1, "послезавтра": 2}[day])
-        elif day:
-            bits = day.split(".")
-            target = target.replace(day=int(bits[0]), month=int(bits[1]), year=int(bits[2]) if len(bits) == 3 else now.year)
-            if len(bits) == 2 and target <= now:
-                target = target.replace(year=now.year + 1)
-        elif target <= now:
-            target += timedelta(days=1)
-    except ValueError as exc:
-        raise ValueError("Такой даты или времени нет.") from exc
-    if target <= now:
-        raise ValueError("Срок уже прошёл. Укажи будущую дату.")
-    return int(target.timestamp())
+    week = re.fullmatch(r"(?:в\s+)?(?:(этот|эту|это|следующий|следующую|следующее)\s+)?("+"|".join(WEEKDAYS)+r")"+time_pattern,s)
+    if week:
+        modifier,day,hour,minute = week.groups()
+        target = clock(hour,minute)
+        delta = WEEKDAYS[day]-now.weekday()
+        if modifier and modifier.startswith('следующ'):
+            target += timedelta(days=delta+7)
+        elif modifier:
+            target += timedelta(days=delta)
+        else:
+            target += timedelta(days=delta%7)
+            if target<=now:
+                target += timedelta(days=7)
+        return future(target)
+    named = re.fullmatch(r"(\d{1,2})\s+("+"|".join(MONTHS)+r")(?:\s+(\d{4})(?:\s*(?:года|г\.?))?)?"+time_pattern,s)
+    numeric = re.fullmatch(r"(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?"+time_pattern,s)
+    if named or numeric:
+        day,month,year,hour,minute = (named or numeric).groups()
+        month = MONTHS[month] if named else int(month)
+        base = clock(hour,minute)
+        years = [int(year)] if year else range(now.year, min(now.year+9,10000))
+        for candidate in years:
+            try:
+                target = base.replace(year=candidate,month=month,day=int(day))
+            except ValueError:
+                continue
+            if target>now:
+                return int(target.timestamp())
+            if year:
+                return future(target)
+        raise ValueError("Такой будущей даты нет. Проверь число, месяц и год.")
+    day = re.fullmatch(r"(сегодня|завтра|послезавтра)"+time_pattern,s)
+    if day:
+        name,hour,minute=day.groups()
+        return future(clock(hour,minute)+timedelta(days={'сегодня':0,'завтра':1,'послезавтра':2}[name]))
+    bare = re.fullmatch(r"(?:в\s+)?(\d{1,2})(?::(\d{2}))?",s)
+    if bare:
+        target=clock(*bare.groups())
+        if target<=now:
+            target+=timedelta(days=1)
+        return future(target)
+    raise ValueError("Не понял срок. Пример: 15 октября, в этот четверг, завтра 18:00 или через 30 минут. Без времени — 09:00 по Москве.")
 
 
 REPEATS = {'daily': 'Раз в день', 'weekly': 'Раз в неделю', 'monthly': 'Раз в месяц', 'yearly': 'Раз в год'}
