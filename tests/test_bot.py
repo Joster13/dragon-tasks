@@ -37,6 +37,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(title,'купить аккумулятор'); self.assertEqual(category,'Личное'); self.assertIsNotNone(due)
         self.assertIsNotNone(parse_task('Завтра в десять позвонить поставщику',NOW)[2])
         self.assertIsNone(parse_task('Купить 2 диска на 8 ТБ',NOW)[2])
+        self.assertIsNone(parse_task('Купить диск 2.5 дюйма',NOW)[2])
     def test_slash_separator(self):
         title,category,due=parse_task('Купить кабель #работа / через 1 час',NOW)
         self.assertEqual((title,category,due),('Купить кабель','Работа',int(NOW.timestamp())+3600))
