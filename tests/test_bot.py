@@ -40,6 +40,7 @@ class CoreTests(unittest.TestCase):
     def test_slash_separator(self):
         title,category,due=parse_task('Купить кабель #работа / через 1 час',NOW)
         self.assertEqual((title,category,due),('Купить кабель','Работа',int(NOW.timestamp())+3600))
+        self.assertEqual(parse_task('Начало работы на Денди #VPN/ завтра 10:00',NOW)[:2],('Начало работы на Денди','VPN'))
         title,category,due=parse_task('Проверить https://example.com/path / завтра 18:00',NOW)
         self.assertEqual(title,'Проверить https://example.com/path')
         self.assertIsNotNone(due)
@@ -149,6 +150,15 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.store.get(1,tid)['due'],due+2*86400)
         await self.callback(f'setrepeat:{tid}:off')
         self.assertEqual(self.store.get(1,tid)['repeat'],'')
+    async def test_start_and_help_are_separate(self):
+        await self.message(text='/start')
+        text=self.session.calls[-1].text
+        self.assertIn('Dragon Tasks | Задачи',text)
+        self.assertIn('Начало работы на Денди #VPN/ завтра 10:00',text)
+        self.assertNotIn('/digest',text)
+        await self.message(text='/help')
+        self.assertIn('/digest',self.session.calls[-1].text)
+        self.assertNotEqual(text,self.session.calls[-1].text)
     async def test_voice_requires_confirmation(self):
         await self.message(voice={'file_id':'v1','file_unique_id':'v','duration':5}); tid=self.store.list(1)[0]['id']
         with patch.dict('os.environ',{'OPENAI_API_KEY':'test'}),patch('main.transcribe',return_value='Купить кабель #работа / завтра 18:00') as mocked:
