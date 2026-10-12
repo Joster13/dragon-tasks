@@ -8,7 +8,7 @@ from aiogram import Bot
 from aiogram.client.session.base import BaseSession
 from aiogram.methods import SendMessage,SendPhoto,SendVoice,EditMessageReplyMarkup
 from aiogram.types import Message
-from core import Store,parse_task,parse_due,next_repeat
+from core import Store,parse_task,parse_due,next_repeat,parse_checklist
 from main import build_dispatcher,scheduler_tick,send_reminder
 TZ=ZoneInfo('Europe/Moscow')
 NOW=datetime(2026,10,12,10,0,tzinfo=TZ)
@@ -61,6 +61,18 @@ class CoreTests(unittest.TestCase):
         for text in ['Купить продукты / 15 октября','15 октября Купить продукты','Купить продукты в этот четверг']:
             with self.subTest(text=text):
                 self.assertEqual(parse_task(text,NOW),('Купить продукты','Личное',stamp(2026,10,15)))
+    def test_checklist_storage_and_parsing(self):
+        self.assertEqual(parse_checklist('Продукты\nМолоко\nХлеб\nСыр'),('Продукты',[('Молоко',False),('Хлеб',False),('Сыр',False)]))
+        self.assertEqual(parse_checklist('- Молоко\n[x] Хлеб'),('Список задач',[('Молоко',False),('Хлеб',True)]))
+        with tempfile.TemporaryDirectory() as tmp:
+            path=str(Path(tmp)/'list.db'); store=Store(path); tid=store.add(1,'Продукты','Личное',None,0)
+            store.add_checklist(1,tid,[('Молоко',False),('Хлеб',True)])
+            item=store.checklist(1,tid)[0]
+            self.assertFalse(store.check_item(2,tid,item['id'],True))
+            store.check_item(1,tid,item['id'],True); store.close(); store=Store(path)
+            self.assertTrue(all(row['done'] for row in store.checklist(1,tid)))
+            self.assertEqual(len(store.export(1)[0]['checklist']),2)
+            store.delete(1,tid); self.assertFalse(store.db.execute('SELECT * FROM checklist_items').fetchall()); store.close()
     def test_repeat_calendar(self):
         def stamp(y,m,d): return int(datetime(y,m,d,10,tzinfo=TZ).timestamp())
         jan=stamp(2027,1,31)
@@ -186,6 +198,44 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await self.message(text='/help')
         self.assertIn('/digest',self.session.calls[-1].text)
         self.assertNotEqual(text,self.session.calls[-1].text)
+    async def test_native_checklist_import_and_progress(self):
+        native={'title':'Продукты','tasks':[{'id':1,'text':'Молоко'},{'id':2,'text':'Хлеб','completion_date':int(NOW.timestamp())},{'id':3,'text':'Сыр'}]}
+        await self.message(checklist=native)
+        tid=self.store.list(1)[0]['id']; items=self.store.checklist(1,tid)
+        self.assertEqual(len(items),3); self.assertEqual([row['done'] for row in items],[0,1,0])
+        self.assertIn('1 из 3 выполнено',self.session.calls[-1].text)
+        self.assertEqual(self.store.checklist_source(1,self.counter),tid)
+        await self.callback(f'check:{tid}:{items[0]["id"]}:1:0')
+        self.assertEqual(self.store.checklist(1,tid)[0]['done'],1)
+        await self.callback(f'shift:{tid}:900')
+        self.assertEqual(self.store.checklist(1,tid)[0]['done'],1)
+        await send_reminder(self.bot,self.store.get(1,tid),self.store,TZ)
+        reminder=self.session.calls[-2]
+        self.assertIn('2 из 3 выполнено',reminder.text)
+        self.assertIn('✅ Молоко',reminder.text); self.assertIn('⬜ Сыр',reminder.text)
+        self.assertEqual(len(reminder.reply_markup.inline_keyboard[0]),2)
+        await self.callback(f'check:{tid}:{items[0]["id"]}:0:0',uid=2)
+        self.assertEqual(self.store.checklist(1,tid)[0]['done'],1)
+        await self.callback(f'clearchecks:{tid}:0'); self.assertFalse(any(row['done'] for row in self.store.checklist(1,tid)))
+    async def test_native_checklist_service_updates(self):
+        native={'title':'Продукты','tasks':[{'id':1,'text':'Молоко'},{'id':2,'text':'Хлеб'}]}
+        await self.message(checklist=native); source_id=self.counter; tid=self.store.list(1)[0]['id']
+        source={'message_id':source_id,'date':int(NOW.timestamp()),'chat':{'id':1,'type':'private'},'checklist':native}
+        await self.message(checklist_tasks_done={'checklist_message':source,'marked_as_done_task_ids':[1],'marked_as_not_done_task_ids':[]})
+        self.assertEqual(self.store.checklist(1,tid)[0]['done'],1)
+        await self.message(checklist_tasks_added={'checklist_message':source,'tasks':[{'id':3,'text':'Сыр'}]})
+        self.assertEqual(len(self.store.checklist(1,tid)),3)
+        updated={**native,'title':'Покупки','tasks':[{'id':1,'text':'Молоко','completion_date':int(NOW.timestamp())},{'id':3,'text':'Сыр'}]}
+        self.counter+=1
+        await self.dp.feed_raw_update(self.bot,{'update_id':self.counter,'edited_message':{**source,'checklist':updated,'from':{'id':1,'is_bot':False,'first_name':'User'}}})
+        self.assertEqual(self.store.get(1,tid)['title'],'Покупки')
+        self.assertEqual([row['text'] for row in self.store.checklist(1,tid)],['Молоко','Сыр'])
+    async def test_text_checklist_and_complete_all(self):
+        await self.message(text='Продукты / завтра 18:00\n- Молоко\n- Хлеб')
+        tid=self.store.list(1,'drafts')[0]['id']
+        self.assertEqual(len(self.store.checklist(1,tid)),2)
+        await self.callback(f'confirm:{tid}'); await self.callback(f'done:{tid}')
+        self.assertTrue(all(row['done'] for row in self.store.checklist(1,tid)))
     async def test_voice_requires_confirmation(self):
         await self.message(voice={'file_id':'v1','file_unique_id':'v','duration':5}); tid=self.store.list(1)[0]['id']
         with patch.dict('os.environ',{'OPENAI_API_KEY':'test'}),patch('main.transcribe',return_value='Купить кабель #работа / завтра 18:00') as mocked:
