@@ -1,4 +1,5 @@
 """Dragon Tasks: private task manager with persistent conversations and attachments."""
+import re
 import asyncio
 import calendar
 import contextlib
@@ -23,11 +24,11 @@ from core import Store, parse_task, parse_due, LISTS
 
 load_dotenv()
 log = logging.getLogger('dragon')
-CATEGORIES = ['Входящие', 'Работа', 'Личное', 'Учёба', 'VPN']
+CATEGORIES = ['Учёба', 'Личное', 'Работа', 'VPN']
 HELP = '''🐉 <b>Dragon Tasks</b>
 Пришли текст, фото, документ, голосовое или перешли сообщение.
 Можно написать: «Завтра в 18:00 купить аккумулятор».
-Точный формат: «Проверить NAS #работа | завтра 10:00».
+Точный формат: «Проверить NAS #работа / завтра 10:00».
 
 После сохранения назначь время и раздел кнопками. Без срока задача остаётся в списке, уведомления не будет.
 
@@ -367,7 +368,7 @@ def build_dispatcher(store,tz,allowed):
                 except ValueError:
                     title,category,due=transcript,task['category'],None
                 # Store draft; no reminders are changed or activated without confirmation.
-                store.edit(uid,tid,title=title,category=category if category!='Входящие' else task['category'],draft=1)
+                store.edit(uid,tid,title=title,category=category if any(tag.lower() in LISTS for tag in re.findall(r'#([\wёЁ]+)', transcript)) else task['category'],draft=1)
                 if due:
                     store.snooze(uid,tid,due)
                 await card(bot,uid,tid,'Распознал. Проверь текст и срок.\n')
@@ -438,12 +439,12 @@ def build_dispatcher(store,tz,allowed):
                 return
         warning=''
         try:
-            title,category,due=parse_task(text,datetime.now(tz)) if text else ('Голосовая задача' if message.voice else 'Фото / вложения','Входящие',None)
+            title,category,due=parse_task(text,datetime.now(tz)) if text else ('Голосовая задача' if message.voice else 'Фото / вложения','Личное',None)
         except ValueError as exc:
             if len(text)>1500:
                 await message.answer(escape(str(exc)))
                 return
-            title,category,due=text or 'Вложение','Входящие',None
+            title,category,due=text or 'Вложение','Личное',None
             warning='⚠️ '+escape(str(exc))+' Сохранил без срока.\n'
         tid=store.add(uid,title,category,due,int(datetime.now(tz).timestamp()))
         if due:
