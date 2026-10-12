@@ -46,6 +46,20 @@ class CoreTests(unittest.TestCase):
         self.assertIsNotNone(due)
         self.assertEqual(parse_task('Проверить https://example.com/path',NOW)[0],'Проверить https://example.com/path')
         with self.assertRaises(ValueError): parse_task('Задача / завтра 25:00',NOW)
+    def test_named_dates_and_weekdays(self):
+        def stamp(y,m,d,h=9): return int(datetime(y,m,d,h,tzinfo=TZ).timestamp())
+        cases={'15 октября':stamp(2026,10,15),'15 октября в 18:00':stamp(2026,10,15,18),
+               '15 октября 2027 года в десять':stamp(2027,10,15,10),'в этот четверг':stamp(2026,10,15),
+               'в эту пятницу в 15:00':stamp(2026,10,16,15),'в следующую пятницу':stamp(2026,10,23),
+               'завтра':stamp(2026,10,13),'15.10':stamp(2026,10,15),'29 февраля':stamp(2028,2,29),
+               '1 января':stamp(2027,1,1)}
+        for text,expected in cases.items():
+            with self.subTest(text=text): self.assertEqual(parse_due(text,NOW),expected)
+        for text in ['31 апреля','15 октября 2025','в этот понедельник','15 октября 25:00']:
+            with self.subTest(text=text),self.assertRaises(ValueError): parse_due(text,NOW)
+        for text in ['Купить продукты / 15 октября','15 октября Купить продукты','Купить продукты в этот четверг']:
+            with self.subTest(text=text):
+                self.assertEqual(parse_task(text,NOW),('Купить продукты','Личное',stamp(2026,10,15)))
     def test_repeat_calendar(self):
         def stamp(y,m,d): return int(datetime(y,m,d,10,tzinfo=TZ).timestamp())
         jan=stamp(2027,1,31)
@@ -150,6 +164,18 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.store.get(1,tid)['due'],due+2*86400)
         await self.callback(f'setrepeat:{tid}:off')
         self.assertEqual(self.store.get(1,tid)['repeat'],'')
+    async def test_manual_named_deadline(self):
+        await self.message(text='Задача'); tid=self.store.list(1)[0]['id']
+        await self.callback(f'custom:{tid}')
+        with patch('main.datetime',wraps=datetime) as clock:
+            clock.now.return_value=NOW
+            await self.message(text='15 октября')
+        self.assertEqual(datetime.fromtimestamp(self.store.get(1,tid)['due'],TZ),datetime(2026,10,15,9,tzinfo=TZ))
+        await self.callback(f'custom:{tid}')
+        with patch('main.datetime',wraps=datetime) as clock:
+            clock.now.return_value=NOW
+            await self.message(text='в этот четверг')
+        self.assertEqual(datetime.fromtimestamp(self.store.get(1,tid)['due'],TZ),datetime(2026,10,15,9,tzinfo=TZ))
     async def test_start_and_help_are_separate(self):
         await self.message(text='/start')
         text=self.session.calls[-1].text
