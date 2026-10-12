@@ -20,7 +20,7 @@ from aiogram.filters import Command
 from aiogram.types import (Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
     ReplyKeyboardMarkup, KeyboardButton, BufferedInputFile, BotCommand)
 from dotenv import load_dotenv
-from core import Store, parse_task, parse_due, LISTS
+from core import Store, parse_task, parse_due, LISTS, REPEATS
 
 load_dotenv()
 log = logging.getLogger('dragon')
@@ -30,7 +30,7 @@ HELP = '''🐉 <b>Dragon Tasks</b>
 Можно написать: «Завтра в 18:00 купить аккумулятор».
 Точный формат: «Проверить NAS #работа / завтра 10:00».
 
-После сохранения назначь время и раздел кнопками. Без срока задача остаётся в списке, уведомления не будет.
+После сохранения назначь время и раздел кнопками. «🔁 Повторение»: раз в день, неделю, месяц или год. Без срока задача остаётся в списке, уведомления не будет.
 
 В напоминании только <b>✅ Выполнено</b> и <b>📅 Перенести</b>.
 Перенос: 15 минут, час, 3 часа, завтра или календарь и своё время.
@@ -48,9 +48,9 @@ def markup(rows):
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t, callback_data=d) for t,d in row] for row in rows])
 
 
-def reminder_keyboard(tid):
+def reminder_keyboard(tid, occurrence=None):
     # Exactly two buttons on every reminder, including reminders with media.
-    return markup([[('✅ Выполнено',f'done:{tid}'),('📅 Перенести',f'move:{tid}')]])
+    return markup([[('✅ Выполнено',f'done:{tid}' + (f':{occurrence}' if occurrence is not None else '')),('📅 Перенести',f'move:{tid}')]])
 
 
 def task_keyboard(task):
@@ -59,17 +59,20 @@ def task_keyboard(task):
     if task['draft']:
         rows.append([('✅ Всё верно — сохранить',f'confirm:{tid}')])
     elif not task['done']:
-        rows.append([('✅ Выполнено',f'done:{tid}'),('📅 Перенести',f'move:{tid}')])
+        rows.append([('✅ Выполнено',f'done:{tid}:{task["due"]}' if task['repeat'] and task['due'] else f'done:{tid}'),('📅 Перенести',f'move:{tid}')])
     rows += [[('⏰ Назначить время',f'move:{tid}'),('📂 Раздел',f'category:{tid}')],
              [('✏️ Изменить текст',f'edit:{tid}'),('📎 Вложения',f'files:{tid}')],
              [('📎 Добавить вложения',f'attach:{tid}'),('🗑 Удалить',f'askdel:{tid}')]]
+    if not task['done']:
+        rows.append([('🔁 Повторение',f'repeat:{tid}')])
     return markup(rows)
 
 
 def format_task(task,tz):
     due = datetime.fromtimestamp(task['due'],tz).strftime('%d.%m.%Y в %H:%M') if task['due'] else 'не назначено'
     status = '📝 Проверь задачу' if task['draft'] else '✅ Выполнено' if task['done'] else '🐉 Задача'
-    return f"<b>{status} #{task['id']}</b>\n{escape(task['title'])}\n\n📂 {escape(task['category'])}\n⏰ {due} · {tz.key}"
+    repetition = '\n🔁 '+REPEATS[task['repeat']] if task['repeat'] else ''
+    return f"<b>{status} #{task['id']}</b>\n{escape(task['title'])}\n\n📂 {escape(task['category'])}\n⏰ {due} · {tz.key}{repetition}"
 
 
 def extract_attachment(message):
@@ -94,10 +97,10 @@ async def send_reminder(bot,task,store,tz):
     files = store.attachments(task['id'])
     text = '⏰ <b>Напоминание</b>\n'+format_task(task,tz)
     if len(files)==1 and files[0]['kind']=='photo' and len(text)<=1024:
-        await bot.send_photo(uid,files[0]['file_id'],caption=text,reply_markup=reminder_keyboard(task['id']))
+        await bot.send_photo(uid,files[0]['file_id'],caption=text,reply_markup=reminder_keyboard(task['id'], task['due'] if task['repeat'] else None))
     else:
         await send_files(bot,uid,files)
-        await bot.send_message(uid,text,reply_markup=reminder_keyboard(task['id']))
+        await bot.send_message(uid,text,reply_markup=reminder_keyboard(task['id'], task['due'] if task['repeat'] else None))
 
 
 class Access(BaseMiddleware):
@@ -259,10 +262,31 @@ def build_dispatcher(store,tz,allowed):
             if task['draft']:
                 await bot.send_message(uid,'Сначала подтверди задачу.')
                 return
+            if task['repeat']:
+                try:
+                    occurrence = int(parts[2]) if len(parts)>2 else task['due']
+                except ValueError:
+                    return
+                store.advance_repeat(uid,tid,occurrence,int(datetime.now(tz).timestamp()),tz)
+                store.clear_input(uid)
+                await query.message.edit_reply_markup(reply_markup=None)
+                await card(bot,uid,tid,'✅ Выполнено. Повторение продолжается.\n')
+                return
             store.finish(uid,tid)
             store.clear_input(uid)
             await query.message.edit_reply_markup(reply_markup=None)
             await bot.send_message(uid,f'✅ Задача #{tid} выполнена.')
+        elif command=='repeat':
+            await bot.send_message(uid,'Как часто напоминать? Повторение идёт автоматически, даже если не нажимать «Выполнено».',reply_markup=markup(
+                [[(label,f'setrepeat:{tid}:{kind}')] for kind,label in REPEATS.items()] +
+                [[('Один раз (выключить повторение)',f'setrepeat:{tid}:off')],[('Назад',f'back:{tid}')]]))
+        elif command=='setrepeat':
+            try:
+                kind = parts[2]
+                store.set_repeat(uid,tid,'' if kind=='off' else kind)
+                await card(bot,uid,tid,'Повторение обновлено.\n')
+            except (ValueError,IndexError) as exc:
+                await bot.send_message(uid,str(exc) if isinstance(exc,ValueError) else 'Выбери период кнопкой.')
         elif command=='move':
             if task['done']:
                 await bot.send_message(uid,'Задача уже выполнена.')
@@ -476,7 +500,10 @@ async def scheduler_tick(bot,store,tz,allowed):
             store.retry(task['id'],ts+60)
             log.warning('Reminder delivery failed; retry scheduled')
         else:
-            store.sent(task['id'])
+            if task['repeat']:
+                store.advance_repeat(task['user_id'],task['id'],task['due'],ts,tz)
+            else:
+                store.sent(task['id'])
     today=now.strftime('%Y-%m-%d')
     for user in store.digest_users():
         uid=user['id']
