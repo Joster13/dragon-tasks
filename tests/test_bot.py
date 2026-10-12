@@ -37,6 +37,14 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(title,'купить аккумулятор'); self.assertEqual(category,'Личное'); self.assertIsNotNone(due)
         self.assertIsNotNone(parse_task('Завтра в десять позвонить поставщику',NOW)[2])
         self.assertIsNone(parse_task('Купить 2 диска на 8 ТБ',NOW)[2])
+    def test_slash_separator(self):
+        title,category,due=parse_task('Купить кабель #работа / через 1 час',NOW)
+        self.assertEqual((title,category,due),('Купить кабель','Работа',int(NOW.timestamp())+3600))
+        title,category,due=parse_task('Проверить https://example.com/path / завтра 18:00',NOW)
+        self.assertEqual(title,'Проверить https://example.com/path')
+        self.assertIsNotNone(due)
+        self.assertEqual(parse_task('Проверить https://example.com/path',NOW)[0],'Проверить https://example.com/path')
+        with self.assertRaises(ValueError): parse_task('Задача / завтра 25:00',NOW)
     def test_persistence_and_drafts(self):
         with tempfile.TemporaryDirectory() as tmp:
             path=str(Path(tmp)/'tasks.db'); store=Store(path)
@@ -93,7 +101,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.get(1,tid)['notified'],1)
     async def test_voice_requires_confirmation(self):
         await self.message(voice={'file_id':'v1','file_unique_id':'v','duration':5}); tid=self.store.list(1)[0]['id']
-        with patch.dict('os.environ',{'OPENAI_API_KEY':'test'}),patch('main.transcribe',return_value='Купить кабель #работа | завтра 18:00') as mocked:
+        with patch.dict('os.environ',{'OPENAI_API_KEY':'test'}),patch('main.transcribe',return_value='Купить кабель #работа / завтра 18:00') as mocked:
             await self.callback(f'speech:{tid}'); mocked.assert_not_called()
             await self.callback(f'speechok:{tid}'); mocked.assert_awaited_once()
         self.assertTrue(self.store.get(1,tid)['draft']); self.assertFalse(self.store.pending(9999999999))
