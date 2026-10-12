@@ -38,7 +38,7 @@ def parse_task(text, now):
                     rf"\b(?:сегодня|завтра|послезавтра)\b{optional_time}",
                     rf"\b(?:в\s+)?(?:(?:этот|эту|это|следующий|следующую|следующее)\s+)?(?:{'|'.join(WEEKDAYS)})\b{optional_time}",
                     rf"\b\d{{1,2}}\s+(?:{'|'.join(MONTHS)})\b(?:\s+\d{{4}}(?:\s*(?:года|г\.?))?)?{optional_time}",
-                    rf"(?<![\d.])\d{{1,2}}\.\d{{1,2}}(?:\.\d{{4}})?{optional_time}(?![\d.])"]
+                    rf"(?<![\d.])\d{{2}}\.\d{{2}}(?:\.\d{{4}})?{optional_time}(?![\d.])"]
         matches = [m for p in patterns for m in re.finditer(p,title,re.I)]
         if len(matches)>1:
             raise ValueError("Нашёл несколько сроков. Укажи один срок после / или назначь его кнопкой.")
