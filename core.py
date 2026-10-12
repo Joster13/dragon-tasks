@@ -1,5 +1,6 @@
 """Persistent tasks and explicit Russian due-date parsing; no external services."""
 import re
+import calendar
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -91,6 +92,37 @@ def parse_due(text, now):
     return int(target.timestamp())
 
 
+REPEATS = {'daily': 'Раз в день', 'weekly': 'Раз в неделю', 'monthly': 'Раз в месяц', 'yearly': 'Раз в год'}
+
+
+def next_repeat(due, kind, anchor, now, tz):
+    current = datetime.fromtimestamp(due, tz)
+    origin = datetime.fromtimestamp(anchor or due, tz)
+    after = datetime.fromtimestamp(now, tz)
+    if kind in ('daily', 'weekly'):
+        days = 1 if kind == 'daily' else 7
+        steps = max(1, (after.date()-current.date()).days // days)
+        target = current + timedelta(days=days*steps)
+        if target <= after:
+            target += timedelta(days=days)
+    elif kind == 'monthly':
+        month = max(current.year*12+current.month, after.year*12+after.month-1)
+        year, index = divmod(month, 12)
+        target = current.replace(year=year, month=index+1, day=min(origin.day, calendar.monthrange(year,index+1)[1]))
+        if target <= after:
+            year,index = divmod(month+1,12)
+            target = current.replace(year=year,month=index+1,day=min(origin.day,calendar.monthrange(year,index+1)[1]))
+    elif kind == 'yearly':
+        year = max(current.year+1,after.year)
+        target = current.replace(year=year,month=origin.month,day=min(origin.day,calendar.monthrange(year,origin.month)[1]))
+        if target <= after:
+            year += 1
+            target = current.replace(year=year,month=origin.month,day=min(origin.day,calendar.monthrange(year,origin.month)[1]))
+    else:
+        raise ValueError('Unknown repetition')
+    return int(target.timestamp())
+
+
 class Store:
     def __init__(self, path):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -121,6 +153,10 @@ class Store:
         columns = {r[1] for r in self.db.execute("PRAGMA table_info(tasks)")}
         if "draft" not in columns:
             self.db.execute("ALTER TABLE tasks ADD COLUMN draft INTEGER NOT NULL DEFAULT 0")
+        if "repeat" not in columns:
+            self.db.execute("ALTER TABLE tasks ADD COLUMN repeat TEXT NOT NULL DEFAULT ''")
+        if "repeat_anchor" not in columns:
+            self.db.execute("ALTER TABLE tasks ADD COLUMN repeat_anchor INTEGER")
         self.db.execute("UPDATE tasks SET category='Личное' WHERE category='Входящие'")
         self.db.commit()
 
@@ -156,7 +192,24 @@ class Store:
 
     def snooze(self, uid, tid, due):
         with self.db:
-            return self.db.execute("UPDATE tasks SET due=?,notified=0,retry_at=0 WHERE user_id=? AND id=? AND done=0", (due,uid,tid)).rowcount
+            return self.db.execute("UPDATE tasks SET due=?,repeat_anchor=?,notified=0,retry_at=0 WHERE user_id=? AND id=? AND done=0", (due,due,uid,tid)).rowcount
+
+    def set_repeat(self, uid, tid, kind):
+        task = self.get(uid,tid)
+        if not task or task['done'] or kind not in ('', *REPEATS):
+            raise ValueError('Недопустимое повторение.')
+        if kind and not task['due']:
+            raise ValueError('Сначала назначь дату и время первого напоминания.')
+        with self.db:
+            self.db.execute("UPDATE tasks SET repeat=?,repeat_anchor=? WHERE user_id=? AND id=?",(kind,task['due'],uid,tid))
+
+    def advance_repeat(self, uid, tid, expected_due, now, tz):
+        task = self.get(uid,tid)
+        if not task or not task['repeat'] or not task['due'] or task['due'] != expected_due:
+            return False
+        due = next_repeat(task['due'],task['repeat'],task['repeat_anchor'],now,tz)
+        with self.db:
+            return bool(self.db.execute("UPDATE tasks SET due=?,notified=0,retry_at=0 WHERE user_id=? AND id=? AND due=? AND done=0",(due,uid,tid,expected_due)).rowcount)
 
     def delete(self, uid, tid):
         with self.db:
