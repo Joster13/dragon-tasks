@@ -9,10 +9,10 @@ LISTS = {"работа": "Работа", "личное": "Личное", "учё
 
 
 def parse_task(text, now):
-    """Accept title [#list] [| deadline]. Never silently discard an invalid date."""
-    parts = text.strip().rsplit("|", 1)
+    """Accept title [#list] [/ deadline]. Never silently discard an invalid date."""
+    parts = re.split(r"\s+/\s+|\s*\|\s*", text.strip(), maxsplit=1)
     title = parts[0].strip()
-    category = "Входящие"
+    category = "Личное"
     for tag in re.findall(r"#([\wёЁ]+)", title):
         if tag.lower() in LISTS:
             category = LISTS[tag.lower()]
@@ -31,7 +31,7 @@ def parse_task(text, now):
                     r"\d{2}\.\d{2}(?:\.\d{4})?\s+(?:в\s+)?\d{1,2}:\d{2}"]
         matches = [m for p in patterns for m in re.finditer(p,title,re.I)]
         if len(matches)>1:
-            raise ValueError("Нашёл несколько сроков. Укажи один срок после | или назначь его кнопкой.")
+            raise ValueError("Нашёл несколько сроков. Укажи один срок после / или назначь его кнопкой.")
         if matches:
             m = matches[0]
             due = parse_due(m.group(),now)
@@ -121,6 +121,7 @@ class Store:
         columns = {r[1] for r in self.db.execute("PRAGMA table_info(tasks)")}
         if "draft" not in columns:
             self.db.execute("ALTER TABLE tasks ADD COLUMN draft INTEGER NOT NULL DEFAULT 0")
+        self.db.execute("UPDATE tasks SET category='Личное' WHERE category='Входящие'")
         self.db.commit()
 
     def register(self, uid):
