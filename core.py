@@ -11,7 +11,7 @@ LISTS = {"работа": "Работа", "личное": "Личное", "учё
 
 def parse_task(text, now):
     """Accept title [#list] [/ deadline]. Never silently discard an invalid date."""
-    parts = re.split(r"\s+/\s+|\s*\|\s*", text.strip(), maxsplit=1)
+    parts = re.split(r"/\s+|\s*\|\s*", text.strip(), maxsplit=1)
     title = parts[0].strip()
     category = "Личное"
     for tag in re.findall(r"#([\wёЁ]+)", title):
