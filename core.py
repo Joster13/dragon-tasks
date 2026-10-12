@@ -151,6 +151,32 @@ def next_repeat(due, kind, anchor, now, tz):
     return int(target.timestamp())
 
 
+def parse_checklist(text):
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    bullet = r'^(?:[-•*]\s+|\d+[.)]\s+|(?:☐|☑|✅|⬜|\[[ xX]\])\s*)'
+    if len(lines)<2:
+        return None
+    if re.match(bullet,lines[0]):
+        title = 'Список задач'
+        rows = lines
+    else:
+        title,rows = lines[0],lines[1:]
+        if len(rows)<2 and not re.match(bullet,rows[0]):
+            return None
+    items = []
+    for row in rows:
+        done = bool(re.match(r'^(?:☑|✅|\[[xX]\])',row))
+        item = re.sub(bullet,'',row).strip()
+        items.append((item,done))
+    validate_checklist(items)
+    return title,items
+
+
+def validate_checklist(items):
+    if not 1<=len(items)<=30 or any(not text.strip() or len(text)>200 for text,done in items) or sum(len(text) for text,done in items)>1200:
+        raise ValueError('Список: до 30 пунктов, до 200 символов в пункте и до 1200 символов суммарно. Раздели длинный список на несколько задач.')
+
+
 class Store:
     def __init__(self, path):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -175,9 +201,19 @@ class Store:
         CREATE TABLE IF NOT EXISTS groups(
           user_id INTEGER NOT NULL, group_id TEXT NOT NULL, task_id INTEGER NOT NULL,
           PRIMARY KEY(user_id,group_id));
+        CREATE TABLE IF NOT EXISTS checklist_sources(
+          user_id INTEGER NOT NULL, message_id INTEGER NOT NULL, task_id INTEGER NOT NULL,
+          PRIMARY KEY(user_id,message_id));
+        CREATE TABLE IF NOT EXISTS checklist_items(
+          id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL,
+          text TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0);
+        CREATE INDEX IF NOT EXISTS checklist_task ON checklist_items(task_id,id);
         CREATE TABLE IF NOT EXISTS inputs(
           user_id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, action TEXT NOT NULL);
         """)
+        checklist_columns = {r[1] for r in self.db.execute("PRAGMA table_info(checklist_items)")}
+        if 'source_item' not in checklist_columns:
+            self.db.execute("ALTER TABLE checklist_items ADD COLUMN source_item INTEGER")
         columns = {r[1] for r in self.db.execute("PRAGMA table_info(tasks)")}
         if "draft" not in columns:
             self.db.execute("ALTER TABLE tasks ADD COLUMN draft INTEGER NOT NULL DEFAULT 0")
@@ -239,10 +275,63 @@ class Store:
         with self.db:
             return bool(self.db.execute("UPDATE tasks SET due=?,notified=0,retry_at=0 WHERE user_id=? AND id=? AND due=? AND done=0",(due,uid,tid,expected_due)).rowcount)
 
+    def add_checklist(self, uid, tid, items, source_ids=None):
+        if not self.get(uid,tid):
+            return False
+        validate_checklist(items)
+        with self.db:
+            self.db.executemany("INSERT INTO checklist_items(task_id,text,done,source_item) VALUES(?,?,?,?)",[(tid,text,int(done),source_ids[index] if source_ids else None) for index,(text,done) in enumerate(items)])
+        return True
+
+    def checklist_source(self, uid, message_id, tid=None):
+        if tid is not None and self.get(uid,tid):
+            with self.db:
+                self.db.execute("INSERT OR REPLACE INTO checklist_sources VALUES(?,?,?)",(uid,message_id,tid))
+        row=self.db.execute("SELECT task_id FROM checklist_sources WHERE user_id=? AND message_id=?",(uid,message_id)).fetchone()
+        return row['task_id'] if row else None
+
+    def sync_native_checklist(self, uid, message_id, native):
+        tid=self.checklist_source(uid,message_id)
+        if tid is None or not self.get(uid,tid):
+            return None
+        items=[(item.text,bool(item.completion_date or item.completed_by_user or item.completed_by_chat)) for item in native.tasks]
+        validate_checklist(items)
+        ids=[item.id for item in native.tasks]
+        if len(set(ids))!=len(ids):
+            raise ValueError('Повторяющиеся ID пунктов списка.')
+        with self.db:
+            for item_id,(text,done) in zip(ids,items):
+                changed=self.db.execute("UPDATE checklist_items SET text=?,done=? WHERE task_id=? AND source_item=?",(text,int(done),tid,item_id)).rowcount
+                if not changed:
+                    self.db.execute("INSERT INTO checklist_items(task_id,text,done,source_item) VALUES(?,?,?,?)",(tid,text,int(done),item_id))
+            self.db.execute("DELETE FROM checklist_items WHERE task_id=? AND source_item NOT IN ("+','.join('?' for _ in ids)+")",(tid,*ids))
+            self.db.execute("UPDATE tasks SET title=? WHERE id=? AND user_id=?",(native.title[:1500],tid,uid))
+        return tid
+
+    def native_checks_done(self, uid, tid, done_ids, undone_ids):
+        if not self.get(uid,tid):
+            return
+        with self.db:
+            for ids,done in [(done_ids,1),(undone_ids,0)]:
+                self.db.executemany("UPDATE checklist_items SET done=? WHERE task_id=? AND source_item=?",[(done,tid,item_id) for item_id in (ids or [])])
+
+    def checklist(self, uid, tid):
+        return self.db.execute("SELECT c.* FROM checklist_items c JOIN tasks t ON t.id=c.task_id WHERE t.user_id=? AND t.id=? ORDER BY c.id",(uid,tid)).fetchall()
+
+    def check_item(self, uid, tid, item_id, done):
+        with self.db:
+            return self.db.execute("UPDATE checklist_items SET done=? WHERE id=? AND task_id=? AND EXISTS(SELECT 1 FROM tasks WHERE id=? AND user_id=?)",(int(done),item_id,tid,tid,uid)).rowcount
+
+    def check_all(self, uid, tid, done):
+        with self.db:
+            return self.db.execute("UPDATE checklist_items SET done=? WHERE task_id=? AND EXISTS(SELECT 1 FROM tasks WHERE id=? AND user_id=?)",(int(done),tid,tid,uid)).rowcount
+
     def delete(self, uid, tid):
         with self.db:
             if not self.get(uid,tid):
                 return 0
+            self.db.execute("DELETE FROM checklist_sources WHERE task_id=?",(tid,))
+            self.db.execute("DELETE FROM checklist_items WHERE task_id=?",(tid,))
             self.db.execute("DELETE FROM attachments WHERE task_id=?",(tid,))
             self.db.execute("DELETE FROM groups WHERE task_id=?",(tid,))
             self.db.execute("DELETE FROM inputs WHERE task_id=?",(tid,))
@@ -279,6 +368,7 @@ class Store:
         result = []
         for r in self.db.execute("SELECT * FROM tasks WHERE user_id=? ORDER BY id", (uid,)):
             item = dict(r)
+            item["checklist"] = [dict(c) for c in self.checklist(uid,r["id"])]
             item["attachments"] = [dict(a) for a in self.attachments(r["id"])]
             result.append(item)
         return result
