@@ -73,6 +73,14 @@ class CoreTests(unittest.TestCase):
             self.assertTrue(all(row['done'] for row in store.checklist(1,tid)))
             self.assertEqual(len(store.export(1)[0]['checklist']),2)
             store.delete(1,tid); self.assertFalse(store.db.execute('SELECT * FROM checklist_items').fetchall()); store.close()
+    def test_spoken_deadlines(self):
+        self.assertEqual(parse_task('Напомни завтра в восемнадцать тридцать купить молоко',NOW)[2],int(datetime(2026,10,13,18,30,tzinfo=TZ).timestamp()))
+        self.assertEqual(parse_due('через тридцать минут',NOW),int(NOW.timestamp())+1800)
+        self.assertEqual(parse_due('через полтора часа',NOW),int(NOW.timestamp())+5400)
+        self.assertEqual(parse_due('пятнадцатого октября',NOW),int(datetime(2026,10,15,9,tzinfo=TZ).timestamp()))
+        self.assertEqual(parse_due('завтра в восемнадцать пять',NOW),int(datetime(2026,10,13,18,5,tzinfo=TZ).timestamp()))
+        self.assertEqual(parse_task('Купить пять кабелей',NOW)[0],'Купить пять кабелей')
+        with self.assertRaises(ValueError): parse_due('завтра в двадцать пять',NOW)
     def test_repeat_calendar(self):
         def stamp(y,m,d): return int(datetime(y,m,d,10,tzinfo=TZ).timestamp())
         jan=stamp(2027,1,31)
@@ -237,12 +245,40 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await self.callback(f'confirm:{tid}'); await self.callback(f'done:{tid}')
         self.assertTrue(all(row['done'] for row in self.store.checklist(1,tid)))
     async def test_voice_requires_confirmation(self):
-        await self.message(voice={'file_id':'v1','file_unique_id':'v','duration':5}); tid=self.store.list(1)[0]['id']
-        with patch.dict('os.environ',{'OPENAI_API_KEY':'test'}),patch('main.transcribe',return_value='Купить кабель #работа / завтра 18:00') as mocked:
-            await self.callback(f'speech:{tid}'); mocked.assert_not_called()
-            await self.callback(f'speechok:{tid}'); mocked.assert_awaited_once()
+        with patch('main.transcribe',return_value='Напомни завтра в восемнадцать тридцать купить кабель') as mocked:
+            await self.message(voice={'file_id':'v1','file_unique_id':'v','duration':5})
+            mocked.assert_awaited_once()
+        tid=self.store.list(1,'drafts')[0]['id']
+        self.assertEqual(self.store.get(1,tid)['title'],'купить кабель')
         self.assertTrue(self.store.get(1,tid)['draft']); self.assertFalse(self.store.pending(9999999999))
+        self.assertTrue(any('Расшифровка ГС' in (getattr(call,'text',None) or '') for call in self.session.calls))
         await self.callback(f'confirm:{tid}'); self.assertFalse(self.store.get(1,tid)['draft'])
         self.assertEqual(self.store.attachments(tid)[0]['kind'],'voice')
+    async def test_failed_voice_keeps_draft_and_audio(self):
+        with patch('main.transcribe',side_effect=ValueError('Не разобрал речь')):
+            await self.message(voice={'file_id':'v1','file_unique_id':'v','duration':5})
+        tid=self.store.list(1,'drafts')[0]['id']
+        self.assertFalse(self.store.pending(9999999999))
+        self.assertEqual(self.store.attachments(tid)[0]['file_id'],'v1')
+        with patch('main.transcribe',return_value='купить молоко'):
+            await self.callback(f'speech:{tid}')
+        self.assertEqual(self.store.get(1,tid)['title'],'купить молоко')
+        self.assertIsNone(self.store.get(1,tid)['due'])
+    async def test_voice_limit(self):
+        with patch('main.transcribe') as mocked:
+            await self.message(voice={'file_id':'v1','file_unique_id':'v','duration':181})
+            mocked.assert_not_awaited()
+        self.assertFalse(self.store.export(1))
+    async def test_repeat_transcription_clears_old_deadline(self):
+        tid=self.store.add(1,'Старая задача','Работа',1,0)
+        self.store.attach(1,tid,'voice','v1',1)
+        async def recognized(*args):
+            self.assertFalse(self.store.pending(9999999999))
+            return 'купить кабель'
+        with patch('main.transcribe',side_effect=recognized):
+            await self.callback(f'speech:{tid}')
+        self.assertEqual(self.store.get(1,tid)['category'],'Работа')
+        self.assertIsNone(self.store.get(1,tid)['due'])
+        self.assertTrue(self.store.get(1,tid)['draft'])
 
 if __name__=='__main__': unittest.main()
