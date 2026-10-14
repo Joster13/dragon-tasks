@@ -80,6 +80,8 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(parse_due('пятнадцатого октября',NOW),int(datetime(2026,10,15,9,tzinfo=TZ).timestamp()))
         self.assertEqual(parse_due('завтра в восемнадцать пять',NOW),int(datetime(2026,10,13,18,5,tzinfo=TZ).timestamp()))
         self.assertEqual(parse_task('Купить пять кабелей',NOW)[0],'Купить пять кабелей')
+        self.assertEqual(parse_task('Купить в два раза больше кабелей',NOW),('Купить в два раза больше кабелей','Личное',None))
+        self.assertEqual(parse_task('Напомни в восемнадцать купить молоко',NOW)[2],int(datetime(2026,10,12,18,tzinfo=TZ).timestamp()))
         with self.assertRaises(ValueError): parse_due('завтра в двадцать пять',NOW)
     def test_repeat_calendar(self):
         def stamp(y,m,d): return int(datetime(y,m,d,10,tzinfo=TZ).timestamp())
