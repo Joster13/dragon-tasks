@@ -80,7 +80,7 @@ def parse_task(text, now):
             m = matches[0]
             due = parse_due(m.group(),now)
             title = (title[:m.start()]+title[m.end():]).strip(" ,.!-")
-            title = re.sub(r"^напомни(?:ть)?(?:\s+мне)?\s*", "", title, flags=re.I).strip(" ,.!-")
+            title = re.sub(r"^напомни(?:ть|м)?\b(?:\s+мне\b)?\s*", "", title, flags=re.I).strip(" ,.!-")
             if not title:
                 raise ValueError("Добавь, о чём напомнить.")
     return title, category, due
