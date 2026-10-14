@@ -191,13 +191,18 @@ def build_dispatcher(store,tz,allowed):
     dp.callback_query.outer_middleware(Access(allowed))
     dp.edited_message.outer_middleware(Access(allowed))
 
-    async def card(bot,uid,tid,prefix=''):
+    async def card(bot,uid,tid,prefix='',message_id=None):
         task = store.get(uid,tid)
         if task:
             files = store.attachments(tid)
             suffix = f'\n📎 Вложений: {len(files)}' if files else ''
             items=store.checklist(uid,tid)
-            await bot.send_message(uid,prefix+format_task(task,tz)+checklist_text(items)+suffix,reply_markup=task_keyboard(task,bool(items),any(item['kind']=='voice' for item in files)))
+            text=prefix+format_task(task,tz)+checklist_text(items)+suffix
+            keyboard=task_keyboard(task,bool(items),any(item['kind']=='voice' for item in files))
+            if message_id is None:
+                await bot.send_message(uid,text,reply_markup=keyboard)
+            else:
+                await bot.edit_message_text(text,chat_id=uid,message_id=message_id,reply_markup=keyboard)
 
     async def recognize_task(bot,uid,tid):
         task=store.get(uid,tid)
@@ -206,7 +211,7 @@ def build_dispatcher(store,tz,allowed):
             await bot.send_message(uid,'В задаче нет голосового.')
             return
         store.edit(uid,tid,draft=1)
-        await bot.send_message(uid,'🎙 Бесплатно распознаю ГС. При первом запуске подготовка модели может занять до 3 минут…')
+        progress=await bot.send_message(uid,'🎙 Распознаю голосовое…')
         try:
             transcript=await transcribe(bot,voices[-1]['file_id'])
             warning=''
@@ -218,12 +223,11 @@ def build_dispatcher(store,tz,allowed):
             store.edit(uid,tid,title=title,category=category if any(tag.lower() in LISTS for tag in re.findall(r'#([\wёЁ]+)',transcript)) else task['category'],draft=1)
             # Replace the previous proposed deadline, including clearing a deadline no longer spoken.
             store.snooze(uid,tid,due)
-            await bot.send_message(uid,'📝 <b>Расшифровка ГС</b>\n'+escape(transcript))
-            await card(bot,uid,tid,warning+'Проверь текст и время, затем нажми «Всё верно — сохранить».\n')
+            await card(bot,uid,tid,warning+'🎙 ГС распознано. Проверь текст и время перед сохранением.\n',message_id=progress.message_id)
         except ValueError as exc:
-            await bot.send_message(uid,escape(str(exc))+'\nОригинал ГС сохранён.',reply_markup=markup([[('🎙 Повторить распознавание',f'speech:{tid}'),('Карточка',f'back:{tid}')]]))
+            await bot.edit_message_text(escape(str(exc))+'\nОригинал ГС сохранён.',chat_id=uid,message_id=progress.message_id,reply_markup=markup([[('🎙 Повторить распознавание',f'speech:{tid}'),('Карточка',f'back:{tid}')]]))
         except (TelegramAPIError,aiohttp.ClientError,asyncio.TimeoutError,RuntimeError,OSError):
-            await bot.send_message(uid,'Не удалось распознать. ГС сохранено. Попробуй ещё раз или напиши текст вручную.',reply_markup=markup([[('🎙 Повторить',f'speech:{tid}'),('Карточка',f'back:{tid}')]]))
+            await bot.edit_message_text('Не удалось распознать. ГС сохранено. Попробуй ещё раз или напиши текст вручную.',chat_id=uid,message_id=progress.message_id,reply_markup=markup([[('🎙 Повторить',f'speech:{tid}'),('Карточка',f'back:{tid}')]]))
 
     async def show(bot,uid,mode='all',category=None,offset=0):
         tasks = store.list(uid,mode,category,datetime.now(tz),limit=9,offset=offset)
@@ -606,9 +610,10 @@ def build_dispatcher(store,tz,allowed):
             store.attach(uid,tid,*attachment,message.message_id)
         if message.media_group_id:
             store.group(uid,message.media_group_id,tid)
-        await card(bot,uid,tid,warning)
         if message.voice:
             await recognize_task(bot,uid,tid)
+        else:
+            await card(bot,uid,tid,warning)
 
     return dp
 
