@@ -16,8 +16,38 @@ MONTHS = {name: number for number, names in enumerate([
 WEEKDAYS = {'понедельник':0,'вторник':1,'среду':2,'среда':2,'четверг':3,'пятницу':4,'пятница':4,'субботу':5,'суббота':5,'воскресенье':6}
 
 
+SPOKEN_NUMBERS = {'ноль':0,'один':1,'одна':1,'два':2,'две':2,'три':3,'четыре':4,'пять':5,'шесть':6,'семь':7,'восемь':8,'девять':9,'десять':10,'одиннадцать':11,'двенадцать':12,'тринадцать':13,'четырнадцать':14,'пятнадцать':15,'шестнадцать':16,'семнадцать':17,'восемнадцать':18,'девятнадцать':19,'двадцать':20,'тридцать':30,'сорок':40,'пятьдесят':50,'шестьдесят':60,'семьдесят':70,'восемьдесят':80,'девяносто':90}
+_SPOKEN_TOKEN = '(?:'+'|'.join(sorted(SPOKEN_NUMBERS,key=len,reverse=True))+')'
+_SPOKEN_NUMBER = '(?:(?:двадцать|тридцать|сорок|пятьдесят|шестьдесят|семьдесят|восемьдесят|девяносто)(?:\\s+(?:один|одна|два|две|три|четыре|пять|шесть|семь|восемь|девять))?|'+_SPOKEN_TOKEN+')'
+
+
+def spoken_number(text):
+    values=[SPOKEN_NUMBERS[word] for word in text.lower().split()]
+    if len(values)==2 and not (values[0]>=20 and values[0]%10==0 and 1<=values[1]<=9):
+        raise ValueError('Не понял число словами.')
+    return sum(values)
+
+
+def normalize_spoken_dates(text):
+    # Change numbers only in explicit date/time contexts; keep titles and prices intact.
+    text=re.sub(r'\bчерез\s+полчаса\b','через 30 минут',text,flags=re.I)
+    text=re.sub(r'\bчерез\s+полтора\s+часа\b','через 90 минут',text,flags=re.I)
+    text=re.sub(r'\bчерез\s+(час|минуту)\b',lambda m:'через 1 '+('час' if m[1].lower()=='час' else 'минуту'),text,flags=re.I)
+    text=re.sub(r'\bчерез\s+('+_SPOKEN_NUMBER+r')\s+(минут[уы]?|час(?:а|ов)?|день|дня|дней)\b',lambda m:'через '+str(spoken_number(m[1]))+' '+m[2],text,flags=re.I)
+    ordinal={'первого':1,'второго':2,'третьего':3,'четвертого':4,'четвёртого':4,'пятого':5,'шестого':6,'седьмого':7,'восьмого':8,'девятого':9,'десятого':10,'одиннадцатого':11,'двенадцатого':12,'тринадцатого':13,'четырнадцатого':14,'пятнадцатого':15,'шестнадцатого':16,'семнадцатого':17,'восемнадцатого':18,'девятнадцатого':19,'двадцатого':20,'тридцатого':30}
+    text=re.sub(r'\b('+'|'.join(ordinal)+r')\s+('+'|'.join(MONTHS)+r')\b',lambda m:str(ordinal[m[1].lower()])+' '+m[2],text,flags=re.I)
+    def replace_time(match):
+        hour=spoken_number(match[2]); minute=spoken_number(match[3]) if match[3] else 0
+        if hour>23 or minute>59:
+            raise ValueError('Проверь время: часы 0–23, минуты 0–59.')
+        return match[1]+' '+f'{hour:02d}:{minute:02d}'
+    text=re.sub(r'\b(в|сегодня|завтра|послезавтра)\s+('+_SPOKEN_NUMBER+r')(?:\s+час(?:а|ов)?)?(?:\s+('+_SPOKEN_NUMBER+r')(?:\s+минут[уы]?)?)?\b',replace_time,text,flags=re.I)
+    return text
+
+
 def parse_task(text, now):
     """Accept title [#list] [/ deadline]. Never silently discard an invalid date."""
+    text = normalize_spoken_dates(text)
     parts = re.split(r"/\s+|\s*\|\s*", text.strip(), maxsplit=1)
     title = parts[0].strip()
     category = "Личное"
@@ -53,6 +83,7 @@ def parse_task(text, now):
 
 
 def parse_due(text, now):
+    text = normalize_spoken_dates(text)
     s = re.sub(r"\s+", " ", text.lower().strip().replace("ё", "е")).strip(" ,!")
     relative = re.fullmatch(r"через\s+(\d{1,4})\s*(мин(?:ут[уы]?)?|м|час(?:а|ов)?|ч|д(?:ень|ня|ней)?|д)", s)
     if relative:
