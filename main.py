@@ -3,11 +3,11 @@ import re
 import asyncio
 import calendar
 import contextlib
-import io
 import json
 import logging
 import os
 from datetime import datetime, timedelta
+from pathlib import Path
 from html import escape
 from zoneinfo import ZoneInfo
 
@@ -20,6 +20,7 @@ from aiogram.filters import Command
 from aiogram.types import (Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
     ReplyKeyboardMarkup, KeyboardButton, BufferedInputFile, BotCommand)
 from dotenv import load_dotenv
+from speech import transcribe as local_transcribe, prepare as prepare_speech, MAX_SECONDS, MAX_AUDIO_BYTES
 from core import Store, parse_task, parse_due, LISTS, REPEATS, parse_checklist, validate_checklist
 
 load_dotenv()
@@ -47,7 +48,7 @@ HELP = '''🐉 <b>Dragon Tasks</b>
 /digest 09:00 или /digest off — сводка
 /export — выгрузка задач · /cancel — отменить ввод
 
-Голосовое сохраняется всегда. Расшифровка — кнопкой с подтверждением отправки аудио в OpenAI, если владелец подключил API. Оригинал остаётся в задаче.'''
+ГС до 3 минут распознаются автоматически и бесплатно на сервере бота. Пришли, например: «Напомни завтра в восемнадцать купить молоко». Получишь текст и карточку: проверь срок и подтверди. До подтверждения уведомлений не будет. Оригинал остаётся в задаче.'''
 
 
 def markup(rows):
@@ -59,7 +60,7 @@ def reminder_keyboard(tid, occurrence=None):
     return markup([[('✅ Выполнено',f'done:{tid}' + (f':{occurrence}' if occurrence is not None else '')),('📅 Перенести',f'move:{tid}')]])
 
 
-def task_keyboard(task, has_checklist=False):
+def task_keyboard(task, has_checklist=False, has_voice=False):
     tid = task['id']
     rows = []
     if task['draft']:
@@ -71,6 +72,8 @@ def task_keyboard(task, has_checklist=False):
              [('📎 Добавить вложения',f'attach:{tid}'),('🗑 Удалить',f'askdel:{tid}')]]
     if has_checklist:
         rows.append([('☑️ Пункты списка',f'checks:{tid}:0')])
+    if has_voice and not task['done']:
+        rows.append([('🎙 Распознать ГС',f'speech:{tid}')])
     if not task['done']:
         rows.append([('🔁 Повторение',f'repeat:{tid}')])
     return markup(rows)
@@ -166,22 +169,20 @@ def calendar_keyboard(tid,year,month):
     return markup(rows)
 
 
-async def transcribe(bot,file_id,key):
-    buf = io.BytesIO()
-    await bot.download(file_id,destination=buf)
-    form = aiohttp.FormData()
-    form.add_field('file',buf.getvalue(),filename='voice.ogg',content_type='audio/ogg')
-    form.add_field('model',os.getenv('TRANSCRIPTION_MODEL','gpt-4o-mini-transcribe'))
-    form.add_field('language','ru')
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=90)) as session:
-        async with session.post('https://api.openai.com/v1/audio/transcriptions',headers={'Authorization':f'Bearer {key}'},data=form) as response:
-            if response.status!=200:
-                raise RuntimeError(f'Transcription HTTP {response.status}')
-            body = await response.json()
-            text = body.get('text','').strip()
-            if not text or len(text)>1500:
-                raise ValueError('Нужен текст от 1 до 1500 символов. Попробуй короткое голосовое.')
-            return text
+def speech_cache():
+    return Path(os.getenv('DB_PATH','data/tasks.sqlite3')).parent / 'speech-models'
+
+
+async def transcribe(bot,file_id):
+    return await local_transcribe(bot,file_id,speech_cache())
+
+
+async def warm_speech():
+    try:
+        await prepare_speech(speech_cache())
+        log.warning('Free Russian speech ready: Vosk')
+    except (OSError,RuntimeError,ValueError,asyncio.TimeoutError):
+        log.warning('Free speech initialization deferred; retry on first voice')
 
 
 def build_dispatcher(store,tz,allowed):
@@ -196,7 +197,33 @@ def build_dispatcher(store,tz,allowed):
             files = store.attachments(tid)
             suffix = f'\n📎 Вложений: {len(files)}' if files else ''
             items=store.checklist(uid,tid)
-            await bot.send_message(uid,prefix+format_task(task,tz)+checklist_text(items)+suffix,reply_markup=task_keyboard(task,bool(items)))
+            await bot.send_message(uid,prefix+format_task(task,tz)+checklist_text(items)+suffix,reply_markup=task_keyboard(task,bool(items),any(item['kind']=='voice' for item in files)))
+
+    async def recognize_task(bot,uid,tid):
+        task=store.get(uid,tid)
+        voices=[item for item in store.attachments(tid) if item['kind']=='voice'] if task else []
+        if not task or not voices:
+            await bot.send_message(uid,'В задаче нет голосового.')
+            return
+        store.edit(uid,tid,draft=1)
+        await bot.send_message(uid,'🎙 Бесплатно распознаю ГС. При первом запуске подготовка модели может занять до 3 минут…')
+        try:
+            transcript=await transcribe(bot,voices[-1]['file_id'])
+            warning=''
+            try:
+                title,category,due=parse_task(transcript,datetime.now(tz))
+            except ValueError as exc:
+                title,category,due=transcript,task['category'],None
+                warning='⚠️ '+escape(str(exc))+' Назначь время вручную.\n'
+            store.edit(uid,tid,title=title,category=category if any(tag.lower() in LISTS for tag in re.findall(r'#([\wёЁ]+)',transcript)) else task['category'],draft=1)
+            # Replace the previous proposed deadline, including clearing a deadline no longer spoken.
+            store.snooze(uid,tid,due)
+            await bot.send_message(uid,'📝 <b>Расшифровка ГС</b>\n'+escape(transcript))
+            await card(bot,uid,tid,warning+'Проверь текст и время, затем нажми «Всё верно — сохранить».\n')
+        except ValueError as exc:
+            await bot.send_message(uid,escape(str(exc))+'\nОригинал ГС сохранён.',reply_markup=markup([[('🎙 Повторить распознавание',f'speech:{tid}'),('Карточка',f'back:{tid}')]]))
+        except (TelegramAPIError,aiohttp.ClientError,asyncio.TimeoutError,RuntimeError,OSError):
+            await bot.send_message(uid,'Не удалось распознать. ГС сохранено. Попробуй ещё раз или напиши текст вручную.',reply_markup=markup([[('🎙 Повторить',f'speech:{tid}'),('Карточка',f'back:{tid}')]]))
 
     async def show(bot,uid,mode='all',category=None,offset=0):
         tasks = store.list(uid,mode,category,datetime.now(tz),limit=9,offset=offset)
@@ -469,31 +496,10 @@ def build_dispatcher(store,tz,allowed):
             await query.message.edit_reply_markup(reply_markup=None)
             await bot.send_message(uid,'🗑 Задача удалена.')
         elif command in ('speech','speechok'):
-            key=os.getenv('OPENAI_API_KEY','').strip()
-            voices=[f for f in store.attachments(tid) if f['kind']=='voice']
-            if not key:
-                await bot.send_message(uid,'Распознавание пока не подключено. Аудио сохранено; название и срок можно задать кнопками.')
+            if task['done']:
+                await bot.send_message(uid,'Задача уже выполнена. Создай новую или отправь новое ГС.')
                 return
-            if not voices:
-                await bot.send_message(uid,'В задаче нет голосового.')
-                return
-            if command=='speech':
-                await bot.send_message(uid,'Отправить последнее голосовое из этой задачи в OpenAI для расшифровки? Используется оплачиваемый API владельца бота.',reply_markup=markup([[('Распознать',f'speechok:{tid}'),('Отмена',f'back:{tid}')]]))
-                return
-            await bot.send_message(uid,'🎙 Распознаю…')
-            try:
-                transcript=await transcribe(bot,voices[-1]['file_id'],key)
-                try:
-                    title,category,due=parse_task(transcript,datetime.now(tz))
-                except ValueError:
-                    title,category,due=transcript,task['category'],None
-                # Store draft; no reminders are changed or activated without confirmation.
-                store.edit(uid,tid,title=title,category=category if any(tag.lower() in LISTS for tag in re.findall(r'#([\wёЁ]+)', transcript)) else task['category'],draft=1)
-                if due:
-                    store.snooze(uid,tid,due)
-                await card(bot,uid,tid,'Распознал. Проверь текст и срок.\n')
-            except (TelegramAPIError,aiohttp.ClientError,asyncio.TimeoutError,RuntimeError,ValueError):
-                await bot.send_message(uid,'Не удалось распознать. Аудио сохранено. Можно повторить или задать текст вручную.')
+            await recognize_task(bot,uid,tid)
 
     @dp.message()
     async def receive(message:Message,bot:Bot):
@@ -503,6 +509,9 @@ def build_dispatcher(store,tz,allowed):
             await message.answer('Неизвестная команда. /help — справка; /cancel — отменить текущий ввод.')
             return
         attachment=extract_attachment(message)
+        if message.voice and (message.voice.duration>MAX_SECONDS or (message.voice.file_size or 0)>MAX_AUDIO_BYTES):
+            await message.answer('Для распознавания пришли ГС до 3 минут и до 10 МБ. Раздели длинную запись на несколько задач.')
+            return
         pending=store.input(uid)
         if message.checklist:
             store.clear_input(uid)
@@ -587,7 +596,7 @@ def build_dispatcher(store,tz,allowed):
             title,category,due=text or 'Вложение','Личное',None
             warning='⚠️ '+escape(str(exc))+' Сохранил без срока.\n'
         tid=store.add(uid,title,category,due,int(datetime.now(tz).timestamp()))
-        if due:
+        if due or message.voice:
             store.edit(uid,tid,draft=1)
         if items:
             store.add_checklist(uid,tid,items,[item.id for item in message.checklist.tasks] if message.checklist else None)
@@ -599,7 +608,7 @@ def build_dispatcher(store,tz,allowed):
             store.group(uid,message.media_group_id,tid)
         await card(bot,uid,tid,warning)
         if message.voice:
-            await message.answer('Оригинал аудио сохранён.',reply_markup=markup([[('🎙 Распознать речь',f'speech:{tid}')]]))
+            await recognize_task(bot,uid,tid)
 
     return dp
 
@@ -670,6 +679,7 @@ async def main():
     bot=Bot(token,default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp=build_dispatcher(store,tz,allowed)
     worker=None
+    speech_worker=None
     try:
         await bot.delete_webhook(drop_pending_updates=False)
         await bot.set_my_commands([BotCommand(command=c,description=d) for c,d in [
@@ -677,8 +687,13 @@ async def main():
             ('drafts','Проверь распознанные задачи'),('digest','Настроить сводку'),('done','Выполненные'),
             ('export','Выгрузить задачи'),('cancel','Отменить ввод'),('help','Справка')]])
         worker=asyncio.create_task(scheduler(bot,store,tz,allowed))
+        speech_worker=asyncio.create_task(warm_speech())
         await dp.start_polling(bot,handle_as_tasks=False,close_bot_session=False)
     finally:
+        if speech_worker:
+            speech_worker.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await speech_worker
         if worker:
             worker.cancel()
             with contextlib.suppress(asyncio.CancelledError):
