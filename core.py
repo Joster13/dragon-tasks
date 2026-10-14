@@ -37,6 +37,8 @@ def normalize_spoken_dates(text):
     ordinal={'первого':1,'второго':2,'третьего':3,'четвертого':4,'четвёртого':4,'пятого':5,'шестого':6,'седьмого':7,'восьмого':8,'девятого':9,'десятого':10,'одиннадцатого':11,'двенадцатого':12,'тринадцатого':13,'четырнадцатого':14,'пятнадцатого':15,'шестнадцатого':16,'семнадцатого':17,'восемнадцатого':18,'девятнадцатого':19,'двадцатого':20,'тридцатого':30}
     text=re.sub(r'\b('+'|'.join(ordinal)+r')\s+('+'|'.join(MONTHS)+r')\b',lambda m:str(ordinal[m[1].lower()])+' '+m[2],text,flags=re.I)
     def replace_time(match):
+        if match[1].lower()=='в' and re.match(r'\s+(?:раза|раз|слоя|слой|части|частях|экземпляра|экземплярах|клика|шага|захода)\b',text[match.end():],re.I):
+            return match[0]
         hour=spoken_number(match[2]); minute=spoken_number(match[3]) if match[3] else 0
         if hour>23 or minute>59:
             raise ValueError('Проверь время: часы 0–23, минуты 0–59.')
@@ -68,8 +70,10 @@ def parse_task(text, now):
                     rf"\b(?:сегодня|завтра|послезавтра)\b{optional_time}",
                     rf"\b(?:в\s+)?(?:(?:этот|эту|это|следующий|следующую|следующее)\s+)?(?:{'|'.join(WEEKDAYS)})\b{optional_time}",
                     rf"\b\d{{1,2}}\s+(?:{'|'.join(MONTHS)})\b(?:\s+\d{{4}}(?:\s*(?:года|г\.?))?)?{optional_time}",
-                    rf"(?<![\d.])\d{{2}}\.\d{{2}}(?:\.\d{{4}})?{optional_time}(?![\d.])"]
-        matches = [m for p in patterns for m in re.finditer(p,title,re.I)]
+                    rf"(?<![\d.])\d{{2}}\.\d{{2}}(?:\.\d{{4}})?{optional_time}(?![\d.])",
+                    r"\bв\s+\d{1,2}:\d{2}\b"]
+        found = {(m.start(),m.end()):m for p in patterns for m in re.finditer(p,title,re.I)}
+        matches = [m for bounds,m in found.items() if not any(a<=bounds[0] and b>=bounds[1] and (a,b)!=bounds for a,b in found)]
         if len(matches)>1:
             raise ValueError("Нашёл несколько сроков. Укажи один срок после / или назначь его кнопкой.")
         if matches:
