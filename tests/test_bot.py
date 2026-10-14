@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 from unittest.mock import patch
 from aiogram import Bot
 from aiogram.client.session.base import BaseSession
-from aiogram.methods import SendMessage,SendPhoto,SendVoice,EditMessageReplyMarkup
+from aiogram.methods import SendMessage,SendPhoto,SendVoice,EditMessageReplyMarkup,EditMessageText
 from aiogram.types import Message
 from core import Store,parse_task,parse_due,next_repeat,parse_checklist
 from main import build_dispatcher,scheduler_tick,send_reminder
@@ -80,6 +80,8 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(parse_due('пятнадцатого октября',NOW),int(datetime(2026,10,15,9,tzinfo=TZ).timestamp()))
         self.assertEqual(parse_due('завтра в восемнадцать пять',NOW),int(datetime(2026,10,13,18,5,tzinfo=TZ).timestamp()))
         self.assertEqual(parse_task('Купить пять кабелей',NOW)[0],'Купить пять кабелей')
+        self.assertEqual(parse_task('Напомним через десять минут купить молоко',NOW)[0],'купить молоко')
+        self.assertEqual(parse_task('Напоминание завтра купить молоко',NOW)[0],'Напоминание  купить молоко')
         self.assertEqual(parse_task('Купить в два раза больше кабелей',NOW),('Купить в два раза больше кабелей','Личное',None))
         self.assertEqual(parse_task('Напомни в восемнадцать купить молоко',NOW)[2],int(datetime(2026,10,12,18,tzinfo=TZ).timestamp()))
         with self.assertRaises(ValueError): parse_due('завтра в двадцать пять',NOW)
@@ -247,13 +249,22 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await self.callback(f'confirm:{tid}'); await self.callback(f'done:{tid}')
         self.assertTrue(all(row['done'] for row in self.store.checklist(1,tid)))
     async def test_voice_requires_confirmation(self):
+        before=len(self.session.calls)
         with patch('main.transcribe',return_value='Напомни завтра в восемнадцать тридцать купить кабель') as mocked:
             await self.message(voice={'file_id':'v1','file_unique_id':'v','duration':5})
             mocked.assert_awaited_once()
         tid=self.store.list(1,'drafts')[0]['id']
         self.assertEqual(self.store.get(1,tid)['title'],'купить кабель')
         self.assertTrue(self.store.get(1,tid)['draft']); self.assertFalse(self.store.pending(9999999999))
-        self.assertTrue(any('Расшифровка ГС' in (getattr(call,'text',None) or '') for call in self.session.calls))
+        calls=self.session.calls[before:]
+        sent=[call for call in calls if isinstance(call,SendMessage)]
+        edited=[call for call in calls if isinstance(call,EditMessageText)]
+        self.assertEqual(len(sent),1)
+        self.assertEqual(sent[0].text,'🎙 Распознаю голосовое…')
+        self.assertEqual(len(edited),1)
+        self.assertIn('купить кабель',edited[0].text)
+        self.assertNotIn('Голосовая задача',edited[0].text)
+        self.assertEqual(edited[0].message_id,before+1)
         await self.callback(f'confirm:{tid}'); self.assertFalse(self.store.get(1,tid)['draft'])
         self.assertEqual(self.store.attachments(tid)[0]['kind'],'voice')
     async def test_failed_voice_keeps_draft_and_audio(self):
